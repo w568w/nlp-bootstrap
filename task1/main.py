@@ -44,10 +44,10 @@ def cross_entropy(y, y_pred):
     return -y * np.log(y_pred)
 
 
-def train(x: ndarray, y: ndarray, index_generator, epochs=1000, learning_rate=0.0001) -> (ndarray, ndarray):
+def train(x: ndarray, y: ndarray, index_generator, epochs=1000, learning_rate=0.001) -> (ndarray, ndarray):
     len_x, num_feature = x.shape
     num_type = y.shape[-1]
-    W = np.random.rand(num_feature, num_type)
+    W = np.ones((num_feature, num_type))
     loss = []
     for epoch in range(epochs):
         id_generator = index_generator(len_x)
@@ -87,9 +87,11 @@ def main():
     labels = file['Sentiment']
     x = generate_ngram(texts, [1, 2, 3])
     y = np.eye(5)[labels]
-    W, loss = train(x, y, mini_batch, epochs=1000)
+    W, loss = train(x, y, mini_batch, epochs=10000)
     plt.plot(range(len(loss)), loss)
     plt.show()
+    error = predict(W, x) - labels
+    print("Error: %d/%d" % (np.count_nonzero(error), len(error)))
 
 
 if __name__ == '__main__':
