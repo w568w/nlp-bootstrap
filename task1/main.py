@@ -1,3 +1,4 @@
+import collections
 import random
 
 import matplotlib.pyplot as plt
@@ -82,15 +83,20 @@ def batch(n):
 
 
 def main():
+    per = 800
     file = pandas.read_csv("train.tsv", sep='\t')[:1000]
     texts = file['Phrase']
     labels = file['Sentiment']
+
     x = generate_ngram(texts, [1, 2, 3])
-    y = np.eye(5)[labels]
-    W, loss = train(x, y, mini_batch, epochs=10000)
-    plt.plot(range(len(loss)), loss)
-    plt.show()
-    error = predict(W, x) - labels
+    y = np.eye(5)[labels[:per]]
+    W, loss = train(x[:per], y, mini_batch, epochs=10000)
+    # plt.plot(range(len(loss)), loss)
+    # plt.show()
+    pred = predict(W, x[per:])
+    print(collections.Counter(pred))
+    print(collections.Counter(labels[per:]))
+    error = pred - labels[per:]
     print("Error: %d/%d" % (np.count_nonzero(error), len(error)))
 
 
