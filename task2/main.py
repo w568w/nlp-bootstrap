@@ -1,5 +1,5 @@
 import collections
-from typing import Tuple
+from typing import Optional
 
 import numpy as np
 import pandas
@@ -7,6 +7,26 @@ import torch
 from matplotlib import pyplot as plt
 from numpy import ndarray
 from torch import nn
+
+
+class RNN(nn.Module):
+    def __init__(self, dict_size, word_num, vector_size, lstm_hidden_size, type_num):
+        super().__init__()
+        self.embedding = nn.Embedding(dict_size, vector_size, padding_idx=0)
+        self.lstm_net = nn.LSTM(vector_size, lstm_hidden_size,
+                                batch_first=True)
+        self.linear_output = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(),
+            nn.Linear(word_num * lstm_hidden_size, type_num),  # (batch_size,type_num)
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # 输入 x(batch_size,word_num)
+        x = self.embedding(x)  # (batch_size,word_num,vector_size)
+        x, _ = self.lstm_net(x)  # (batch_size,word_num,lstm_hidden_size)
+        return self.linear_output(x)
 
 
 class CNN(nn.Module):
@@ -60,18 +80,23 @@ def generate_vectors(texts: list[str]) -> tuple[ndarray, int]:
 
 
 def main():
+    net = "rnn"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using {device} device")
-    per = 800
+    per = 8000
     batch_size = 50
-    file = pandas.read_csv("train.tsv", sep='\t')[:1000]
+    file = pandas.read_csv("train.tsv", sep='\t')[:10000]
     texts = file['Phrase']
     labels = file['Sentiment']
     vec, dict_num = generate_vectors(texts)
     x = torch.from_numpy(vec).to(device)
     y = torch.from_numpy(labels[:per].values).to(device)
 
-    model = CNN(dict_num, x.shape[-1], 128, 2, [2, 3, 4], 5).to(device)
+    model: Optional[nn.Module]
+    if net == "cnn":
+        model = CNN(dict_num, x.shape[-1], 128, 2, [2, 3, 4], 5).to(device)
+    elif net == "rnn":
+        model = RNN(dict_num, x.shape[-1], 128, 100, 5).to(device)
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
 
