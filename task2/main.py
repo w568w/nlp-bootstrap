@@ -96,7 +96,7 @@ def main():
     if net == "cnn":
         model = CNN(dict_num, x.shape[-1], 128, 2, [2, 3, 4], 5).to(device)
     elif net == "rnn":
-        model = RNN(dict_num, x.shape[-1], 128, 100, 5).to(device)
+        model = RNN(dict_num, x.shape[-1], 128, 500, 5).to(device)
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
 
