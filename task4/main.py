@@ -64,22 +64,72 @@ class CRF(nn.Module):
         """
         batch_size, word_len, _ = P.shape
         P = self.expand_P(P)
+        expP = torch.exp(P)
         expA = torch.exp(self.A)
-        Z = expA[[self.n], :self.n]  # (1,n)
         expsubA = expA[:self.n, :self.n]  # (n,n)
-        # 递推在所有路径上求和
-        for t in range(1, word_len + 1):
-            Z = (Z @ expsubA) * P[:, [t], :self.n]  # (batch_size,1,n)
-        return torch.squeeze(torch.log(torch.sum(Z * expA[:self.n, self.n + 1], dim=2)), dim=-1)
+        # 第 0 步的选择
+        Z = expA[[self.n], :self.n] * expP[:, [1], :self.n]  # (batch_size,1,n)
+        # 递推在所有路径上求积（指数的和）
+        for t in range(2, word_len + 1):
+            Z = (Z @ expsubA) * expP[:, [t], :self.n]  # (batch_size,1,n)
+        result = torch.squeeze(torch.log(torch.sum(Z * expA[:self.n, self.n + 1], dim=2)), dim=-1)
+        return result
+
+    def viterbi(self, P: Tensor, word_len: int, tag_num: int):
+        """
+
+        :param tag_num
+        :param word_len
+        :param P: (word_len+2,tag_num+2)
+        :return: (word_len)
+        """
+        min_length = torch.zeros((word_len, tag_num))
+        last_step = -1 * torch.ones((word_len, tag_num), dtype=torch.int32)
+        # 第 0 步
+        min_length[0] = self.A[[self.n], :self.n] + P[1, :tag_num]
+        # 动态规划求下一步
+        for t in range(1, word_len):
+            for this_index in range(tag_num):
+                current_best_length = 1e5
+                current_best_index = -1
+                for last_index in range(tag_num):
+                    edge_weight = self.A[last_index][this_index] + P[t + 1][this_index]
+                    if min_length[t - 1][last_index] + edge_weight < current_best_length:
+                        current_best_index = last_index
+                        current_best_length = min_length[t - 1][last_index] + edge_weight
+                min_length[t][this_index] = current_best_length
+                last_step[t][this_index] = current_best_index
+
+        # 收束的最后一步
+        total_best_length = 1e5
+        total_best_index = -1
+        for last_index in range(tag_num):
+            edge_weight = self.A[last_index][self.n + 1]
+            if min_length[-1, last_index] + edge_weight < total_best_length:
+                total_best_length = min_length[-1, last_index] + edge_weight
+                total_best_index = last_index
+        path = []
+        while total_best_index >= 0:
+            path.append(total_best_index)
+            total_best_index = last_step[word_len - len(path)][total_best_index].item()
+        path.reverse()
+        return path
+
+    def predict(self, P: Tensor):
+        """
+
+        :param P: (batch_size,word_len,tag_num)
+        :return: (batch_size,word_len)
+        """
+        batch_size, word_len, tag_num = P.shape
+        P = self.expand_P(P)
+        return torch.tensor([self.viterbi(P[i], word_len, tag_num) for i in range(batch_size)])
 
     def forward(self, y: Tensor, P: Tensor, output_loss=True):
         if output_loss:
             return -(self.score(y, P) - self.Z(P))
         else:
             return self.predict(P)
-
-    def predict(self, P: Tensor):
-        raise NotImplementedError()
 
 
 class LSTMCRF(nn.Module):
@@ -143,22 +193,23 @@ def generate_vectors(texts: List[List[str]], labels: List[List[str]]) -> Tuple[n
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     # Torch 训练优化
     torch.autograd.set_detect_anomaly(False)
     torch.autograd.profiler.emit_nvtx(False)
     torch.autograd.profiler.profile(False)
 
-    torch.set_default_tensor_type(torch.cuda.DoubleTensor)
+    torch.set_default_tensor_type(torch.DoubleTensor)
     x_data, y_data = read_dataset("eng.testa")
     x, y, dict_size = generate_vectors(x_data, y_data)
     x, y = torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
     model = LSTMCRF(dict_size, 300, 100, 6).to(device)
 
-    per = 8000
-    batch_size = 1
+    per = 800
+    batch_size = 32
     loss_fn = torch.erf
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     loss_history = []
     for epoch in range(100):
@@ -167,17 +218,17 @@ def main():
             this_x, this_y = x[i:i + batch_size], y[i:i + batch_size]
 
             pred = model(this_x, this_y)
-            loss = pred
+            loss = pred.mean()
             loss.backward()
             optimizer.step()
-
             loss_history.append(loss.item())
             with torch.no_grad():
-                # result = torch.argmax(model(x[per:]), dim=-1)
-                # error = result - y[per:]
+                result = model(x[:10], None, output_loss=False)
+                error = result - y[:10]
+                error = torch.sum(torch.abs(error), dim=1)
                 loop.set_description(f'Epoch [{epoch}/100]')
-                loop.set_postfix(loss=sum(loss_history[-10:]) / len(loss_history[-10:]), )
-                # valid_error=torch.count_nonzero(error) / len(error))
+                loop.set_postfix(loss=sum(loss_history[-10:]) / len(loss_history[-10:]),
+                                 valid_error=torch.sum(error)/10)
                 loop.update()
         loop.close()
         torch.save(model.state_dict(), "result.pt")
