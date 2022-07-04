@@ -14,9 +14,12 @@ from torch.utils.data.dataset import T_co, random_split
 from tqdm import tqdm
 from torchsampler import ImbalancedDatasetSampler
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 
-def sum_tensor_list(size, values):
-    summation = torch.zeros(size)
+
+def sum_tensor_list(values):
+    summation = torch.zeros_like(values[0])
     for i in range(0, len(values)):
         summation += values[i]
     return summation
@@ -73,8 +76,8 @@ class CRF(nn.Module):
         """
         prediction = self.expand_prediction(prediction, real_length)
 
-        s1 = sum_tensor_list((1,), [self.A[prediction[i], prediction[i + 1]] for i in range(real_length + 1)])
-        s2 = sum_tensor_list((1,), [P[i, prediction[i]] for i in range(1, real_length + 1)])
+        s1 = sum_tensor_list([self.A[prediction[i], prediction[i + 1]] for i in range(real_length + 1)])
+        s2 = sum_tensor_list([P[i, prediction[i]] for i in range(1, real_length + 1)])
         return s1 + s2
 
     def _Z(self, P: Tensor, real_length: int) -> Tensor:
@@ -159,7 +162,7 @@ class CRF(nn.Module):
         batch_size, word_len, _ = P.shape
         P = self.expand_P(P, real_lengths)
         if output_loss:
-            return torch.cat(
+            return torch.stack(
                 [self._Z(P[i], real_lengths[i]) - self._score(y[i], P[i], real_lengths[i]) for i in range(batch_size)])
         else:
             padded_result = self.predict(P, real_lengths)
@@ -188,7 +191,7 @@ class CONLLDataset(Dataset):
     def __init__(self, file_path):
         x_data, y_data = self.read_dataset(file_path)
         self.x, self.x_lens, self.y, self._dict_size = self.generate_vectors(x_data, y_data)
-        self.x, self.x_lens, self.y = map(lambda x: torch.from_numpy(x), (self.x, self.x_lens, self.y))
+        self.x, self.x_lens, self.y = map(lambda x: torch.from_numpy(x).to(device), (self.x, self.x_lens, self.y))
 
     def __getitem__(self, index: Any) -> T_co:
         return self.x[index], self.x_lens[index], self.y[index]
@@ -255,19 +258,23 @@ def get_labels(subset):
 
 
 def evaluate(model: nn.Module, x: Tensor, x_lens: Tensor, y: Tensor):
-    with torch.no_grad():
-        batch_size = x.shape[0]
-        result = model(x, x_lens, None, output_loss=False).int()
-        evaluation = []
-        for i in range(batch_size):
-            evaluation.append(
-                torch.sum(torch.eq(result[i][:x_lens[i].item()], y[i][:x_lens[i].item()]).int()).item() / x_lens[i])
+    batch_size = x.shape[0]
+    result = model(x, x_lens, None, output_loss=False).int()
+    evaluation = []
+    zeros = []
+    zeros_y = []
+    for i in range(batch_size):
+        evaluation.append(
+            torch.sum(torch.eq(result[i][:x_lens[i].item()], y[i][:x_lens[i].item()]).int()) / x_lens[i])
+        zeros.append(torch.sum(torch.eq(result[i][:x_lens[i].item()], torch.zeros(x_lens[i].item())).int()))
+        zeros_y.append(torch.sum(torch.eq(y[i][:x_lens[i].item()], torch.zeros(x_lens[i].item())).int()))
 
-        return sum(evaluation) / batch_size
+    return {"validation_accu": sum_tensor_list(evaluation) / batch_size,
+            "zero": sum_tensor_list(zeros),
+            "zero_y": sum_tensor_list(zeros_y)}
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     # Torch 训练优化
     torch.autograd.set_detect_anomaly(False)
     torch.autograd.profiler.emit_nvtx(False)
@@ -277,10 +284,10 @@ def main():
         torch.set_default_tensor_type(torch.cuda.DoubleTensor)
     else:
         torch.set_default_tensor_type(torch.DoubleTensor)
-    dataset = CONLLDataset("eng.train")
+    dataset = CONLLDataset("eng.testa")
     per = floor(0.8 * len(dataset))
-    train_dataset, valid_dataset = random_split(dataset, (per, len(dataset) - per),generator=torch.Generator(device))
-    model = LSTMCRF(dataset.dict_size(), dataset.word_num(), 300, 100, 6).to(device)
+    train_dataset, valid_dataset = random_split(dataset, (per, len(dataset) - per), generator=torch.Generator(device))
+    model = LSTMCRF(dataset.dict_size(), dataset.word_num(), 300, 100, 8).to(device)
 
     batch_size = 8
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -290,16 +297,16 @@ def main():
     for epoch in range(100):
         loop = tqdm(total=len(train_loader))
         for i, data in enumerate(train_loader):
-            this_x, this_x_lengths, this_y = data
-
-            pred = model(this_x, this_x_lengths, this_y)
-            loss = pred.mean()
+            loss = model(*data)
+            pred = evaluate(model, *data)
+            # 增加惩罚项，迫使网络不要输出 0
+            loss = loss.mean() + torch.relu((pred["zero"] - pred["zero_y"])) * 100
             loss.backward()
             optimizer.step()
             loss_history.append(loss.item())
             loop.set_description(f'Epoch [{epoch}/100]')
             loop.set_postfix(loss=sum(loss_history[-10:]) / len(loss_history[-10:]),
-                             train_accuracy=evaluate(model, *valid_dataset[:10]))
+                             **evaluate(model, *valid_dataset[:10]))
             loop.update()
         loop.close()
         torch.save(model.state_dict(), "result.pt")
