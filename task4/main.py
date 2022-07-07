@@ -1,21 +1,22 @@
-import collections
 from math import floor
 from typing import List, Tuple, Dict, Any
 
-import numpy as np
-import pandas
 import torch
 import torch.nn.functional as F
-from numpy import ndarray
 from torch import nn, Tensor
 from torch.nn.utils import rnn
+from torch.nn.utils.rnn import pack_sequence, PackedSequence, pad_packed_sequence, pack_padded_sequence, pad_sequence
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataset import T_co, random_split
 from tqdm import tqdm
-from torchsampler import ImbalancedDatasetSampler
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 device = "cpu"
+
+
+def simple_elementwise_apply(fn: nn.Module, packed_sequence: PackedSequence):
+    """applies a point wise function fn to each element in packed_sequence"""
+    return torch.nn.utils.rnn.PackedSequence(fn(packed_sequence.data), packed_sequence.batch_sizes)
 
 
 def sum_tensor_list(values):
@@ -105,35 +106,35 @@ class CRF(nn.Module):
         :param P: (word_len+2,tag_num+2)
         :return: (word_len)
         """
-        min_length = torch.zeros((word_len, tag_num))
-        last_step = -1 * torch.ones((word_len, tag_num), dtype=torch.int32)
+        max_length = torch.zeros((word_len, tag_num))
+        last_step = -1 * torch.ones((word_len, tag_num), dtype=torch.int16)
         # 第 0 步
-        min_length[0] = self.A[[self.n], :self.n] + P[1, :tag_num]
+        max_length[0] = self.A[self.n, :self.n] + P[1, :tag_num]
         # 动态规划求下一步
         for t in range(1, word_len):
             for this_index in range(tag_num):
                 current_best_length = -10000
                 current_best_index = -1
                 for last_index in range(tag_num):
-                    edge_weight = self.A[last_index][this_index] + P[t + 1][this_index]
-                    if min_length[t - 1][last_index] + edge_weight > current_best_length:
+                    edge_weight = self.A[last_index][this_index] + P[t + 1][this_index] + max_length[t - 1][last_index]
+                    if edge_weight > current_best_length:
                         current_best_index = last_index
-                        current_best_length = min_length[t - 1][last_index] + edge_weight
-                min_length[t][this_index] = current_best_length
+                        current_best_length = edge_weight
+                max_length[t][this_index] = current_best_length
                 last_step[t][this_index] = current_best_index
 
         # 收束的最后一步
         total_best_length = -10000
         total_best_index = -1
         for last_index in range(tag_num):
-            edge_weight = self.A[last_index][self.n + 1]
-            if min_length[-1, last_index] + edge_weight > total_best_length:
-                total_best_length = min_length[-1, last_index] + edge_weight
+            edge_weight = self.A[last_index][self.n + 1] + max_length[-1, last_index]
+            if edge_weight > total_best_length:
+                total_best_length = edge_weight
                 total_best_index = last_index
         path = []
         while total_best_index >= 0:
             path.append(total_best_index)
-            total_best_index = last_step[word_len - len(path)][total_best_index].item()
+            total_best_index = last_step[word_len - len(path)][total_best_index]
         path.reverse()
         return path
 
@@ -146,7 +147,7 @@ class CRF(nn.Module):
         """
         batch_size, _, tag_num_plus_two = P.shape
         return rnn.pad_sequence(
-            [torch.tensor(self.viterbi(P[i], real_lengths[i].item(), tag_num_plus_two - 2), dtype=torch.int64) for i in
+            [torch.tensor(self.viterbi(P[i], real_lengths[i].item(), tag_num_plus_two - 2), dtype=torch.int16) for i in
              range(batch_size)],
             batch_first=True, padding_value=-1)
 
@@ -170,34 +171,41 @@ class CRF(nn.Module):
 
 
 class LSTMCRF(nn.Module):
-    def __init__(self, dict_size, word_num, vector_size, lstm_hidden_size, tag_num):
+    def __init__(self, dict_size, vector_size, lstm_hidden_size, tag_num):
         super(LSTMCRF, self).__init__()
         self.embedding = nn.Embedding(dict_size, vector_size, padding_idx=-1)
+        torch.nn.init.xavier_uniform_(self.embedding.weight)
         self.input_encoding = \
             nn.LSTM(vector_size, lstm_hidden_size, batch_first=True, bidirectional=True, bias=False)
-        self.smp = nn.Sequential(nn.BatchNorm1d(word_num),
-                                 nn.Linear(2 * lstm_hidden_size, tag_num, bias=False), nn.Softmax(dim=-1))
+        self.smp = nn.Sequential(
+            nn.Dropout(),
+            nn.Linear(2 * lstm_hidden_size, tag_num, bias=False), nn.Tanh())
         self.crf_layer = CRF(tag_num)
 
-    def forward(self, x: Tensor, real_lengths: Tensor, y: Tensor, output_loss=True):
+    def forward(self, x: PackedSequence, y: PackedSequence, output_loss=True):
         # 输入 x (batch_size,word_num), y (batch_size,word_num)
-        x = self.embedding(x)  # (batch_size,word_num,vector_size)
+        x = simple_elementwise_apply(self.embedding, x)  # (batch_size,word_num,vector_size)
         x, _ = self.input_encoding(x)  # (batch_size,word_num,2 * lstm_hidden_size)
-        x = self.smp(x)  # (batch_size,word_num,tag_num)
-        return self.crf_layer(y, x, real_lengths, output_loss=output_loss)
+        x = simple_elementwise_apply(self.smp, x)  # (batch_size,word_num,tag_num)
+        if y is not None:
+            y, y_lens = pad_packed_sequence(y, batch_first=True)
+        x, x_lens = pad_packed_sequence(x, batch_first=True)
+        return self.crf_layer(y, x,
+                              x_lens,
+                              output_loss=output_loss)
 
 
 class CONLLDataset(Dataset):
     def __init__(self, file_path):
         x_data, y_data = self.read_dataset(file_path)
-        self.x, self.x_lens, self.y, self._dict_size = self.generate_vectors(x_data, y_data)
-        self.x, self.x_lens, self.y = map(lambda x: torch.from_numpy(x).to(device), (self.x, self.x_lens, self.y))
+        self.x, self.y, self._dict_size = self.generate_vectors(x_data, y_data)
+        # self.x = list(map(lambda x: x.to(device), self.x))
+        # self.y = list(map(lambda x: x.to(device), self.y))
 
     def __getitem__(self, index: Any) -> T_co:
-        return self.x[index], self.x_lens[index], self.y[index]
-
-    def word_num(self):
-        return self.x.shape[-1]
+        if isinstance(index, list):
+            return [self.x[i] for i in index], [self.y[i] for i in index],
+        return self.x[index], self.y[index]
 
     def dict_size(self):
         return self._dict_size
@@ -217,7 +225,7 @@ class CONLLDataset(Dataset):
                         x_line.clear()
                         y_line.clear()
                 else:
-                    x_line.append(parts[0])
+                    x_line.append(parts[0].lower())
                     y_line.append(parts[3])
         if len(x_line) > 0 and len(y_line) > 0:
             x_data.append(x_line.copy())
@@ -225,53 +233,78 @@ class CONLLDataset(Dataset):
         return x_data, y_data
 
     def generate_vectors(self, texts: List[List[str]], labels: List[List[str]]) -> Tuple[
-        ndarray, ndarray, ndarray, int]:
+        List[Tensor], List[Tensor], int]:
         phrase_dict: Dict[str, int] = {}
-        real_lengths = np.zeros((len(texts)), dtype=np.int64)
         max_text_len = 0
         for i, sentence in enumerate(texts):
             max_text_len = max(max_text_len, len(sentence))
-            real_lengths[i] = len(sentence)
             for phrase in sentence:
                 if phrase not in phrase_dict:
                     phrase_dict[phrase] = len(phrase_dict)
-        features = np.zeros((len(texts), max_text_len), dtype=np.int64)
+        features = []
         for i, sentence in enumerate(texts):
+            feature = torch.zeros((len(sentence),), dtype=torch.int16, device="cpu")
             for j, phrase in enumerate(sentence):
-                features[i][j] = phrase_dict[phrase]
-        num_labels = np.ones((len(texts), max_text_len), dtype=np.int64) * -1
+                feature[j] = phrase_dict[phrase]
+            features.append(feature)
+        num_labels = []
         for i, label in enumerate(labels):
+            num_label = torch.zeros((len(label),), dtype=torch.int16, device="cpu")
             for j, single_label in enumerate(label):
-                num_labels[i][j] = \
+                num_label[j] = \
                     {'O': 0, 'I-ORG': 1, 'I-PER': 2, 'I-LOC': 3, 'I-MISC': 4, 'B-MISC': 5, 'B-LOC': 6, 'B-ORG': 7,
                      'B-PER': 8}[
                         single_label]
-        return features, real_lengths, num_labels, len(phrase_dict)
+            num_labels.append(num_label)
+        return features, num_labels, len(phrase_dict)
 
     def __len__(self):
-        return len(self.x_lens)
+        return len(self.x)
 
 
-def get_labels(subset):
-    return [(torch.count_nonzero(torch.where(subset[i][2] > 0)[0]) > subset[i][1] / 2).int().item() for i in
-            range(len(subset))]
-
-
-def evaluate(model: nn.Module, x: Tensor, x_lens: Tensor, y: Tensor):
+def evaluate_confusion(model: nn.Module, tag_num: int, x: PackedSequence, y: PackedSequence):
+    cf = torch.zeros((tag_num, tag_num))
+    result = model(x, None, output_loss=False).int()
+    y, y_lens = pad_packed_sequence(y, batch_first=True)
+    x, x_lens = pad_packed_sequence(x, batch_first=True)
     batch_size = x.shape[0]
-    result = model(x, x_lens, None, output_loss=False).int()
-    evaluation = []
-    zeros = []
-    zeros_y = []
     for i in range(batch_size):
-        evaluation.append(
-            torch.sum(torch.eq(result[i][:x_lens[i].item()], y[i][:x_lens[i].item()]).int()) / x_lens[i])
-        zeros.append(torch.sum(torch.eq(result[i][:x_lens[i].item()], torch.zeros(x_lens[i].item())).int()))
-        zeros_y.append(torch.sum(torch.eq(y[i][:x_lens[i].item()], torch.zeros(x_lens[i].item())).int()))
+        for j in range(x_lens[i].item()):
+            cf[y[i][j]][result[i][j]] += 1
+    return cf
 
-    return {"validation_accu": sum_tensor_list(evaluation) / batch_size,
-            "zero": sum_tensor_list(zeros),
-            "zero_y": sum_tensor_list(zeros_y)}
+
+def evaluate_f1(confusion_matrix: Tensor):
+    tag_num = confusion_matrix.shape[0]
+    f1 = []
+    for tag in range(tag_num):
+        predict_num = torch.sum(confusion_matrix[:, tag]).item()
+        actual_num = torch.sum(confusion_matrix[tag]).item()
+        correct_num = confusion_matrix[tag][tag].item()
+        try:
+            precision = predict_num / correct_num
+            recall = actual_num / correct_num
+            f1.append(2.0 / (precision + recall))
+        except ZeroDivisionError:
+            f1.append(-1)
+    return f1
+
+
+def pack_sequence_cpu(sequences, enforce_sorted=True):
+    lengths = torch.as_tensor([v.size(0) for v in sequences], device=torch.device("cpu"))
+    return pack_padded_sequence(pad_sequence(sequences), lengths, enforce_sorted=enforce_sorted)
+
+
+def pack_collate_fn(data):
+    x = list(map(lambda t: t[0], data))
+    y = list(map(lambda t: t[1], data))
+    return pack_two(x, y)
+
+
+def pack_two(x, y):
+    x.sort(key=lambda x: len(x), reverse=True)
+    y.sort(key=lambda x: len(x), reverse=True)
+    return pack_sequence_cpu(x).to(device), pack_sequence_cpu(y).to(device)
 
 
 def main():
@@ -287,27 +320,27 @@ def main():
     dataset = CONLLDataset("eng.testa")
     per = floor(0.8 * len(dataset))
     train_dataset, valid_dataset = random_split(dataset, (per, len(dataset) - per), generator=torch.Generator(device))
-    model = LSTMCRF(dataset.dict_size(), dataset.word_num(), 300, 100, 8).to(device)
+    model = LSTMCRF(dataset.dict_size(), 300, 100, 9).to(device)
 
     batch_size = 8
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size,
-                              sampler=ImbalancedDatasetSampler(train_dataset, callback_get_label=get_labels))
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, collate_fn=pack_collate_fn)
     loss_history = []
     for epoch in range(100):
         loop = tqdm(total=len(train_loader))
         for i, data in enumerate(train_loader):
             loss = model(*data)
-            pred = evaluate(model, *data)
+            # pred = evaluate(model, *data)
             # 增加惩罚项，迫使网络不要输出 0
-            loss = loss.mean() + torch.relu((pred["zero"] - pred["zero_y"])) * 100
+            loss = loss.mean()
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0, norm_type=2)
             optimizer.step()
             loss_history.append(loss.item())
             loop.set_description(f'Epoch [{epoch}/100]')
-            loop.set_postfix(loss=sum(loss_history[-10:]) / len(loss_history[-10:]),
-                             **evaluate(model, *valid_dataset[:10]))
+            loop.set_postfix(loss=sum(loss_history[-10:]) / len(loss_history[-10:]))
             loop.update()
+        print(evaluate_f1(evaluate_confusion(model, 9, *pack_two(*valid_dataset[:50]))))
         loop.close()
         torch.save(model.state_dict(), "result.pt")
 
