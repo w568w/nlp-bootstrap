@@ -107,7 +107,7 @@ class CRF(nn.Module):
         :return: (word_len)
         """
         max_length = torch.zeros((word_len, tag_num))
-        last_step = -1 * torch.ones((word_len, tag_num), dtype=torch.int16)
+        last_step = -1 * torch.ones((word_len, tag_num), dtype=torch.int32)
         # 第 0 步
         max_length[0] = self.A[self.n, :self.n] + P[1, :tag_num]
         # 动态规划求下一步
@@ -147,7 +147,7 @@ class CRF(nn.Module):
         """
         batch_size, _, tag_num_plus_two = P.shape
         return rnn.pad_sequence(
-            [torch.tensor(self.viterbi(P[i], real_lengths[i].item(), tag_num_plus_two - 2), dtype=torch.int16) for i in
+            [torch.tensor(self.viterbi(P[i], real_lengths[i].item(), tag_num_plus_two - 2), dtype=torch.int32) for i in
              range(batch_size)],
             batch_first=True, padding_value=-1)
 
@@ -243,13 +243,13 @@ class CONLLDataset(Dataset):
                     phrase_dict[phrase] = len(phrase_dict)
         features = []
         for i, sentence in enumerate(texts):
-            feature = torch.zeros((len(sentence),), dtype=torch.int16, device="cpu")
+            feature = torch.zeros((len(sentence),), dtype=torch.int32, device="cpu")
             for j, phrase in enumerate(sentence):
                 feature[j] = phrase_dict[phrase]
             features.append(feature)
         num_labels = []
         for i, label in enumerate(labels):
-            num_label = torch.zeros((len(label),), dtype=torch.int16, device="cpu")
+            num_label = torch.zeros((len(label),), dtype=torch.int32, device="cpu")
             for j, single_label in enumerate(label):
                 num_label[j] = \
                     {'O': 0, 'I-ORG': 1, 'I-PER': 2, 'I-LOC': 3, 'I-MISC': 4, 'B-MISC': 5, 'B-LOC': 6, 'B-ORG': 7,
@@ -317,7 +317,7 @@ def main():
         torch.set_default_tensor_type(torch.cuda.DoubleTensor)
     else:
         torch.set_default_tensor_type(torch.DoubleTensor)
-    dataset = CONLLDataset("eng.testa")
+    dataset = CONLLDataset("eng.train")
     per = floor(0.8 * len(dataset))
     train_dataset, valid_dataset = random_split(dataset, (per, len(dataset) - per), generator=torch.Generator(device))
     model = LSTMCRF(dataset.dict_size(), 300, 100, 9).to(device)
