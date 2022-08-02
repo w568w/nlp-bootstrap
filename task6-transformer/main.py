@@ -1,12 +1,14 @@
 import math
 import os
 from typing import Union, Dict, Tuple, Optional, Sequence, List, Any
+
+import optuna
 import torch
 from optuna import Trial
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from torch import nn, Tensor
 import torch.nn.functional as F
-from torch.nn.utils.rnn import PackedSequence, pad_packed_sequence, pack_padded_sequence, pad_sequence
+from torch.nn.utils.rnn import PackedSequence, pad_packed_sequence, pack_padded_sequence, pad_sequence, pack_sequence
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, random_split, Dataset
 import pytorch_lightning as pl
@@ -48,19 +50,20 @@ def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask
     :param mask: 遮罩层
     """
     _, sentence_len, key_dim = query.shape
-    attention = (query @ key.T) / torch.sqrt(key_dim)  # (batch_size,sentence_len,sentence_len)
-    if mask:
-        attention = torch.masked_fill(attention, mask, -1e100)
+    attention = (query @ torch.transpose(key, -1, - 2)) / math.sqrt(
+        key_dim)  # (batch_size,sentence_len,sentence_len)
+    if mask is not None:
+        attention = torch.masked_fill(attention, mask, -1e10)
     attention = torch.softmax(attention, dim=-1)
     return attention @ value  # (batch_size,sentence_len,value_dim)
 
 
-def add_and_norm_dropout(module: nn.Module, input_tensor: Tensor, module_dropout: Optional[float] = None, *module_args):
+def add_and_norm_dropout(module: nn.Module, input_tensor: Tensor, module_args, module_dropout: Optional[float] = None):
     if module_dropout:
         result = input_tensor + F.dropout(module(*module_args), module_dropout)
     else:
         result = input_tensor + module(*module_args)
-    return F.layer_norm(result, result.shape[-1])
+    return F.layer_norm(result, [result.shape[-1]])
 
 
 def positional_encoding(x: Tensor):
@@ -72,7 +75,7 @@ def positional_encoding(x: Tensor):
     position = torch.range(0, sentence_len - 1)  # (sentence_len)
     position = torch.unsqueeze(position, dim=1).expand(sentence_len, vector_dim)  # (sentence_len,vector_dim)
     division = torch.exp(torch.range(0, vector_dim - 1, 2) * -math.log(1e4) / vector_dim)  # (vector_dim // 2)
-    division = torch.unsqueeze(division, dim=1).expand(sentence_len, vector_dim // 2)  # (sentence_len,vector_dim // 2)
+    division = torch.unsqueeze(division, dim=0).expand(sentence_len, vector_dim // 2)  # (sentence_len,vector_dim // 2)
     pe = torch.zeros(sentence_len, vector_dim)
     pe[:, 0::2] = torch.sin(position[:, 0::2] * division)
     pe[:, 1::2] = torch.cos(position[:, 1::2] * division)
@@ -159,11 +162,11 @@ class EncoderLayer(nn.Module):
         """
         dropout = self.sublayer_dropout if self.training else None
         sentence_len = x.shape[-2]
-        x = add_and_norm_dropout(self.multi_head_attention, x, dropout,
+        x = add_and_norm_dropout(self.multi_head_attention, x,
                                  (x, x, x, build_mask_from_padding_lengths(
-                                     real_lengths, sentence_len)))  # (batch_size,sentence_len,in_out_dim)
-        return add_and_norm_dropout(self.ffn, x, dropout,
-                                    (x,))  # (batch_size,sentence_len,in_out_dim)
+                                     real_lengths, sentence_len)), dropout)  # (batch_size,sentence_len,in_out_dim)
+        return add_and_norm_dropout(self.ffn, x,
+                                    (x,), dropout)  # (batch_size,sentence_len,in_out_dim)
 
 
 class DecoderLayer(nn.Module):
@@ -192,14 +195,13 @@ class DecoderLayer(nn.Module):
         """
         dropout = self.sublayer_dropout if self.training else None
         sentence_len = x.shape[-2]
-        x = add_and_norm_dropout(self.masked_multi_head_attention, x, dropout,
+        x = add_and_norm_dropout(self.masked_multi_head_attention, x,
                                  (x, x, x, build_mask_from_padding_lengths(
-                                     real_lengths, sentence_len), True))
-        x = add_and_norm_dropout(self.multi_head_attention, x, dropout,
+                                     real_lengths, sentence_len), True), dropout)
+        x = add_and_norm_dropout(self.multi_head_attention, x,
                                  (encoder_output, encoder_output, x,
-                                  build_mask_from_padding_lengths(encoder_real_lengths, sentence_len)))
-        return add_and_norm_dropout(self.ffn, x, dropout,
-                                    (x,))  # (batch_size,sentence_len,in_out_dim)
+                                  build_mask_from_padding_lengths(encoder_real_lengths, sentence_len)), dropout)
+        return add_and_norm_dropout(self.ffn, x, (x,), dropout)  # (batch_size,sentence_len,in_out_dim)
 
 
 class Transformer(pl.LightningModule):
@@ -241,8 +243,7 @@ class Transformer(pl.LightningModule):
         )
 
     def core_calculate(self, x: PackedSequence, y: PackedSequence):
-        x_max_len, y_max_len = torch.max(x.batch_sizes), torch.max(y.batch_sizes)
-        max_len = max(x_max_len, y_max_len)
+        max_len = max(len(x.batch_sizes), len(y.batch_sizes))
 
         x, x_lens = pad_packed_sequence(x, batch_first=True, total_length=max_len)
         y, y_lens = pad_packed_sequence(y, batch_first=True, total_length=max_len)
@@ -260,6 +261,9 @@ class Transformer(pl.LightningModule):
             embedded_y = self.decoders[i](embedded_y, embedded_x, y_lens, x_lens)
 
         return self.output_layer(embedded_y)  # (batch_size,max_len,vocab_size)
+
+    def forward(self, x: PackedSequence, y: PackedSequence, *args, **kwargs) -> Any:
+        return self.core_calculate(x, y)
 
     def training_step(self, batch: Tuple[PackedSequence, PackedSequence], batch_idx, *args, **kwargs) -> STEP_OUTPUT:
         x, y = batch
@@ -286,7 +290,12 @@ class Transformer(pl.LightningModule):
 
 
 def main():
-    pass
+    def objective(trial):
+        model = Transformer.create_from_trial(trial, 100)
+        return 1  # An objective value linked with the Trial object.
+
+    study = optuna.create_study()  # Create a new study.
+    study.optimize(objective, n_trials=1)  # Invoke optimization of the objective function.
 
 
 if __name__ == '__main__':
