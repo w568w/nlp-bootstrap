@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Union, Dict, Tuple, Optional, Sequence, List, Any
 import torch
@@ -8,6 +9,8 @@ from torch.nn.utils.rnn import PackedSequence, pad_packed_sequence, pack_padded_
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, random_split, Dataset
 import pytorch_lightning as pl
+
+CKPT_PATH = "newest.ckpt"
 
 
 def build_mask_from_padding_lengths(real_lengths: Tensor, padded_length: int):
@@ -57,6 +60,22 @@ def add_and_norm_dropout(module: nn.Module, input_tensor: Tensor, module_dropout
     else:
         result = input_tensor + module(*module_args)
     return F.layer_norm(result, result.shape[-1])
+
+
+def positional_encoding(x: Tensor):
+    """
+    为输入添加位置编码。
+    :param x: (batch_size,sentence_len,vector_dim)
+    """
+    batch_size, sentence_len, vector_dim = x.shape
+    position = torch.range(0, sentence_len - 1)  # (sentence_len)
+    position = torch.unsqueeze(position, dim=1).expand(sentence_len, vector_dim)  # (sentence_len,vector_dim)
+    division = torch.exp(torch.range(0, vector_dim - 1, 2) * -math.log(1e4) / vector_dim)  # (vector_dim // 2)
+    division = torch.unsqueeze(division, dim=1).expand(sentence_len, vector_dim // 2)  # (sentence_len,vector_dim // 2)
+    pe = torch.zeros(sentence_len, vector_dim)
+    pe[:, 0::2] = torch.sin(position[:, 0::2] * division)
+    pe[:, 1::2] = torch.cos(position[:, 1::2] * division)
+    return x + pe
 
 
 class MultiHeadAttention(nn.Module):
@@ -183,5 +202,75 @@ class DecoderLayer(nn.Module):
 
 
 class Transformer(pl.LightningModule):
-    def __init__(self, *args: Any, **kwargs: Any):
+    """
+    注：有关 vocab_id 的约定：
+    0：padding，即无文字也无标志；
+    1 ~ vocab_size-3：普通的文字；
+    vocab_size-2：<BOS>；
+    vocab_size-1：<EOS>。
+
+    数据集在给数据时，始终应该：x 两端无任何标志。y 两端有 <BOS> 和 <EOS> 标志。
+    """
+
+    def __init__(self, stack_num: int, vocab_size: int, embed_dim: int, ffn_hidden_dim: int, head_num: int,
+                 dropout: float, *args: Any,
+                 **kwargs: Any):
         super().__init__(*args, **kwargs)
+
+        default_biased = False
+        self.head_num = head_num
+        self.embed_dim = embed_dim
+
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.encoders = nn.ModuleList(
+            [EncoderLayer(embed_dim, ffn_hidden_dim, head_num, dropout) for _ in range(stack_num)])
+        self.decoders = nn.ModuleList(
+            [DecoderLayer(embed_dim, embed_dim, ffn_hidden_dim, head_num, dropout) for _ in range(stack_num)])
+        self.output_layer = nn.Sequential(
+            nn.Linear(embed_dim, vocab_size, bias=default_biased),
+            nn.Softmax(dim=-1)
+        )
+
+    def core_calculate(self, x: PackedSequence, y: PackedSequence):
+        x_max_len, y_max_len = torch.max(x.batch_sizes), torch.max(y.batch_sizes)
+        max_len = max(x_max_len, y_max_len)
+
+        x, x_lens = pad_packed_sequence(x, batch_first=True, total_length=max_len)
+        y, y_lens = pad_packed_sequence(y, batch_first=True, total_length=max_len)
+        # 需保证训练时看到的 y 不含 <EOS>。
+        y_lens -= 1
+
+        embedded_x, embedded_y = \
+            self.embedding(x) * math.sqrt(self.embed_dim), \
+            self.embedding(y) * math.sqrt(self.embed_dim)  # (batch_size,max_len,embed_dim)
+        embedded_x, embedded_y = positional_encoding(embedded_x), positional_encoding(embedded_y)
+
+        for i in range(self.head_num):
+            embedded_x = self.encoders[i](embedded_x, x_lens)
+        for i in range(self.head_num):
+            embedded_y = self.decoders[i](embedded_y, embedded_x, y_lens, x_lens)
+
+        return self.output_layer(embedded_y)  # (batch_size,max_len,vocab_size)
+
+    def training_step(self, batch: Tuple[PackedSequence, PackedSequence], batch_idx, *args, **kwargs) -> STEP_OUTPUT:
+        x, y = batch
+        output = self.core_calculate(x, y)  # (batch_size,max_len,vocab_size)
+        batch_size, max_len, _ = output.shape
+        output = torch.flatten(output, start_dim=0, end_dim=1)  # (batch_size*max_len,vocab_size)
+        y, _ = pad_packed_sequence(y, batch_first=True, total_length=max_len)  # (batch_size,max_len)
+        # 删去第一个字符（<EOS>），并在最后补充一列
+        y = torch.cat([y[:, 1:], torch.zeros((batch_size, 1))], dim=-1)
+        y = torch.flatten(y)
+
+        loss = F.cross_entropy(output, y)
+        self.log("train_loss", loss)
+        return loss
+
+    def configure_optimizers(self) -> Optional[Union[
+        Optimizer, Sequence[Optimizer], Dict, Sequence[Dict], Tuple[List, List]
+    ]]:
+        return torch.optim.Adam(self.parameters(), lr=1 / math.sqrt(self.embed_dim))
+
+    def on_train_epoch_end(self) -> None:
+        super().on_train_epoch_end()
+        self.trainer.save_checkpoint(CKPT_PATH)
