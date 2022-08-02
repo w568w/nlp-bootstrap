@@ -2,6 +2,7 @@ import math
 import os
 from typing import Union, Dict, Tuple, Optional, Sequence, List, Any
 import torch
+from optuna import Trial
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -212,6 +213,14 @@ class Transformer(pl.LightningModule):
     数据集在给数据时，始终应该：x 两端无任何标志。y 两端有 <BOS> 和 <EOS> 标志。
     """
 
+    @staticmethod
+    def create_from_trial(trial: Trial, vocab_size: int):
+        return Transformer(stack_num=trial.suggest_int("stack_num", 1, 8), vocab_size=vocab_size,
+                           embed_dim=trial.suggest_int("embed_dim", 128, 1024, 8),
+                           ffn_hidden_dim=trial.suggest_int("ffn_hidden_dim", 512, 2048, 8),
+                           head_num=trial.suggest_categorical("head_num", [1, 2, 4, 8]),
+                           dropout=trial.suggest_float("dropout", 0.1, 0.5))
+
     def __init__(self, stack_num: int, vocab_size: int, embed_dim: int, ffn_hidden_dim: int, head_num: int,
                  dropout: float, *args: Any,
                  **kwargs: Any):
@@ -274,3 +283,11 @@ class Transformer(pl.LightningModule):
     def on_train_epoch_end(self) -> None:
         super().on_train_epoch_end()
         self.trainer.save_checkpoint(CKPT_PATH)
+
+
+def main():
+    pass
+
+
+if __name__ == '__main__':
+    main()
